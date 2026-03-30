@@ -1,5 +1,5 @@
 const API_BASE_URL = "https://script.google.com/macros/s/AKfycbzm9qYUzXWfmMSm_9M3rqnJbUNvrFUkIyD-MqVt1p77cGgs2urrSWOnsaaq1JU7fNvhlg/exec";
-const SAVE_QUEUE_KEY = "pending_answer_queue_v2";
+const SAVE_QUEUE_KEY = "pending_answer_queue_v3";
 
 const state = {
   username: "",
@@ -28,13 +28,12 @@ const restartBtn = document.getElementById("restartBtn");
 
 startBtn.addEventListener("click", startQuiz);
 clearCacheBtn.addEventListener("click", clearCache);
+nextBtn.addEventListener("click", goToNextQuestion);
+restartBtn.addEventListener("click", resetApp);
 
 usernameInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") startQuiz();
 });
-
-nextBtn.addEventListener("click", goToNextQuestion);
-restartBtn.addEventListener("click", resetApp);
 
 window.addEventListener("online", () => {
   processSaveQueue();
@@ -49,6 +48,8 @@ document.addEventListener("visibilitychange", () => {
     processSaveQueue();
   }
 });
+
+setupExitFlush();
 
 async function startQuiz() {
   const username = usernameInput.value.trim();
@@ -139,6 +140,7 @@ function renderQuestion() {
     finalAnswer: "",
     changeCount: 0,
     submitCount: 0,
+    isSaved: true,
   };
 
   nextBtn.disabled = !currentResponse.finalAnswer;
@@ -166,6 +168,7 @@ function chooseAnswer(answer) {
     finalAnswer: "",
     changeCount: 0,
     submitCount: 0,
+    isSaved: true,
   };
 
   const isDifferentAnswer =
@@ -177,8 +180,7 @@ function chooseAnswer(answer) {
     : currentResponse.changeCount;
 
   if (isDifferentAnswer && currentResponse.changeCount >= 2) {
-    statusMessage.textContent =
-      "You can only change your answer up to 2 times.";
+    statusMessage.textContent = "You can only change your answer up to 2 times.";
     return;
   }
 
@@ -211,25 +213,29 @@ function chooseAnswer(answer) {
   processSaveQueue();
 }
 
-function goToNextQuestion() {
+async function goToNextQuestion() {
   const question = state.questions[state.currentIndex];
   if (!question) return;
 
   const currentResponse = state.responsesByQuestionId[question.id];
 
   if (!currentResponse || !currentResponse.finalAnswer) {
-    statusMessage.textContent =
-      "Please select an answer before continuing.";
+    statusMessage.textContent = "Please select an answer before continuing.";
     return;
   }
 
-  state.currentIndex += 1;
+  statusMessage.textContent = "";
 
-  if (state.currentIndex >= state.questions.length) {
+  const isLastQuestion = state.currentIndex >= state.questions.length - 1;
+
+  if (isLastQuestion) {
+    await flushQueueImmediately();
+    flushQueueOnExit();
     showDoneScreen();
     return;
   }
 
+  state.currentIndex += 1;
   renderQuestion();
 }
 
@@ -303,14 +309,89 @@ async function processSaveQueue() {
         }
       } catch (error) {
         console.error("processSaveQueue item error:", error);
-        statusMessage.textContent =
-          "Your response has been selected, but saving is still pending.";
         break;
       }
     }
   } finally {
     state.isQueueProcessing = false;
   }
+}
+
+async function flushQueueImmediately() {
+  const queue = getQueueFromStorage();
+  if (!queue.length) return;
+
+  const currentQueue = [...queue];
+
+  for (const item of currentQueue) {
+    try {
+      const result = await apiPost({
+        action: "save_answer",
+        username: item.username,
+        question: item.question,
+        answer: item.answer,
+        submitCount: item.submitCount,
+        changeCount: item.changeCount,
+      });
+
+      if (result.ok) {
+        removeQueueItem(item.queueId);
+
+        const responseState = state.responsesByQuestionId[item.questionId];
+        if (
+          responseState &&
+          responseState.finalAnswer === item.answer &&
+          responseState.submitCount === item.submitCount
+        ) {
+          state.responsesByQuestionId[item.questionId] = {
+            ...responseState,
+            isSaved: true,
+            latestSavedAt: result.savedAt || "",
+          };
+        }
+      }
+    } catch (error) {
+      console.error("flushQueueImmediately error:", error);
+      break;
+    }
+  }
+}
+
+function setupExitFlush() {
+  window.addEventListener("pagehide", flushQueueOnExit);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      flushQueueOnExit();
+    }
+  });
+}
+
+function flushQueueOnExit() {
+  const queue = getQueueFromStorage();
+  if (!queue.length) return;
+
+  const pendingItems = queue.slice(0, 10);
+
+  pendingItems.forEach((item) => {
+    const payload = JSON.stringify({
+      action: "save_answer",
+      username: item.username,
+      question: item.question,
+      answer: item.answer,
+      submitCount: item.submitCount,
+      changeCount: item.changeCount,
+    });
+
+    const blob = new Blob([payload], {
+      type: "text/plain;charset=utf-8",
+    });
+
+    const sent = navigator.sendBeacon(API_BASE_URL, blob);
+
+    if (sent) {
+      removeQueueItem(item.queueId);
+    }
+  });
 }
 
 function hydrateResponsesFromQueue(username) {
@@ -400,3 +481,4 @@ function setLoading(button, isLoading, label) {
 function generateId() {
   return `q_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
+
