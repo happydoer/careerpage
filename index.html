@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Question Flow</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <section class="card login-card" id="loginSection">
+      <div class="brand-line"></div>
+      <h1>Question Flow</h1>
+
+
+      <label for="usernameInput" class="label">Username</label>
+      <input
+        type="text"
+        id="usernameInput"
+        class="text-input"
+        placeholder="e.g. lan.hoang"
+        autocomplete="off"
+      />
+
+      <div class="button-group">
+        <button id="startBtn" class="primary-btn" type="button">Start</button>
+        <button id="clearCacheBtn" class="secondary-btn" type="button">Clear cache</button>
+      </div>
+
+      <p id="loginMessage" class="message" aria-live="polite"></p>
+    </section>
+
+    <section class="card quiz-card hidden" id="quizSection">
+      <div class="progress-row">
+        <span id="progressText">Question 1 / 1</span>
+      </div>
+
+      <div class="question-block">
+        <p class="question-label">Question</p>
+        <h2 id="questionText"></h2>
+      </div>
+
+      <div class="answers-block">
+        <p class="answer-label">Select one answer</p>
+        <div id="answersContainer" class="answers-list"></div>
+      </div>
+
+      <div class="action-row">
+        <button id="nextBtn" class="secondary-btn" type="button" disabled>
+          Next question
+        </button>
+      </div>
+
+      <p id="statusMessage" class="message" aria-live="polite"></p>
+    </section>
+
+    <section class="card done-card hidden" id="doneSection">
+      <div class="brand-line"></div>
+      <h2>You have completed the questionnaire</h2>
+      <p>Thank you for answering all questions.</p>
+      <button id="restartBtn" class="primary-btn" type="button">
+        Restart with another user
+      </button>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
