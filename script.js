@@ -1,5 +1,7 @@
 const API_BASE_URL = "https://script.google.com/macros/s/AKfycbzm9qYUzXWfmMSm_9M3rqnJbUNvrFUkIyD-MqVt1p77cGgs2urrSWOnsaaq1JU7fNvhlg/exec";
-const SAVE_QUEUE_KEY = "pending_answer_queue_v3";
+const SAVE_QUEUE_KEY = "pending_answer_queue_v5";
+const INIT_CACHE_KEY = "init_cache_v2";
+const INIT_CACHE_MAX_AGE_MS = 3600000; // 1 hour
 
 const state = {
   username: "",
@@ -7,6 +9,8 @@ const state = {
   currentIndex: 0,
   responsesByQuestionId: {},
   isQueueProcessing: false,
+  currentSavePromise: null,
+  currentSaveMeta: null,
 };
 
 const loginSection = document.getElementById("loginSection");
@@ -60,6 +64,22 @@ async function startQuiz() {
     return;
   }
 
+  // --- Fast path: check localStorage for cached init response ---
+  const cached = getInitCache(username);
+  if (cached) {
+    applyInitResult(cached);
+    // Background refresh: update cache silently, don't block UI
+    apiPost({ action: "init", username })
+      .then((result) => {
+        if (result.ok) {
+          setInitCache(username, result);
+        }
+      })
+      .catch(() => { /* silent */ });
+    return;
+  }
+
+  // --- Slow path: first-ever login, must wait for API ---
   setLoading(startBtn, true, "Checking...");
 
   try {
@@ -73,24 +93,8 @@ async function startQuiz() {
       return;
     }
 
-    state.username = result.username;
-    state.questions = Array.isArray(result.questions) ? result.questions : [];
-    state.currentIndex = 0;
-    state.responsesByQuestionId = {};
-
-    if (!state.questions.length) {
-      loginMessage.textContent = "No questions available.";
-      return;
-    }
-
-    hydrateResponsesFromQueue(result.username);
-
-    loginSection.classList.add("hidden");
-    doneSection.classList.add("hidden");
-    quizSection.classList.remove("hidden");
-    renderQuestion();
-
-    processSaveQueue();
+    setInitCache(username, result);
+    applyInitResult(result);
   } catch (error) {
     console.error("startQuiz error:", error);
     loginMessage.textContent =
@@ -100,12 +104,68 @@ async function startQuiz() {
   }
 }
 
+/** Apply a successful init result to app state and show quiz */
+function applyInitResult(result) {
+  state.username = result.username;
+  state.questions = Array.isArray(result.questions) ? result.questions : [];
+  state.currentIndex = 0;
+  state.responsesByQuestionId = {};
+  state.currentSavePromise = null;
+  state.currentSaveMeta = null;
+
+  if (!state.questions.length) {
+    loginMessage.textContent = "No questions available.";
+    return;
+  }
+
+  hydrateResponsesFromQueue(result.username);
+
+  loginSection.classList.add("hidden");
+  doneSection.classList.add("hidden");
+  quizSection.classList.remove("hidden");
+  renderQuestion();
+
+  processSaveQueue();
+}
+
+function getInitCache(username) {
+  try {
+    const raw = localStorage.getItem(INIT_CACHE_KEY);
+    if (!raw) return null;
+    const entry = JSON.parse(raw);
+    if (
+      entry &&
+      entry.username &&
+      entry.username.toLowerCase() === username.toLowerCase() &&
+      entry.cachedAt &&
+      Date.now() - entry.cachedAt < INIT_CACHE_MAX_AGE_MS
+    ) {
+      return entry.data;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function setInitCache(username, data) {
+  try {
+    localStorage.setItem(
+      INIT_CACHE_KEY,
+      JSON.stringify({ username, data, cachedAt: Date.now() })
+    );
+  } catch {
+    /* quota exceeded – ignore */
+  }
+}
+
 async function clearCache() {
   loginMessage.textContent = "";
   setLoading(clearCacheBtn, true, "Clearing...");
 
   try {
     clearQueueStorage();
+    localStorage.removeItem(INIT_CACHE_KEY);
 
     const result = await apiPost({
       action: "clear_cache",
@@ -141,6 +201,7 @@ function renderQuestion() {
     changeCount: 0,
     submitCount: 0,
     isSaved: true,
+    pendingQueueId: null,
   };
 
   nextBtn.disabled = !currentResponse.finalAnswer;
@@ -169,6 +230,7 @@ function chooseAnswer(answer) {
     changeCount: 0,
     submitCount: 0,
     isSaved: true,
+    pendingQueueId: null,
   };
 
   const isDifferentAnswer =
@@ -185,6 +247,11 @@ function chooseAnswer(answer) {
   }
 
   const nextSubmitCount = (currentResponse.submitCount || 0) + 1;
+  const queueId = generateId();
+
+  if (currentResponse.pendingQueueId) {
+    removeQueueItem(currentResponse.pendingQueueId);
+  }
 
   state.responsesByQuestionId[question.id] = {
     ...currentResponse,
@@ -193,14 +260,24 @@ function chooseAnswer(answer) {
     submitCount: nextSubmitCount,
     queuedAt: new Date().toISOString(),
     isSaved: false,
+    pendingQueueId: queueId,
   };
 
   updateAnswerSelection(answer);
   nextBtn.disabled = false;
   statusMessage.textContent = "";
 
+  const payload = {
+    action: "save_answer",
+    username: state.username,
+    question: question.question,
+    answer,
+    submitCount: nextSubmitCount,
+    changeCount: nextChangeCount,
+  };
+
   enqueueSave({
-    queueId: generateId(),
+    queueId,
     username: state.username,
     questionId: question.id,
     question: question.question,
@@ -209,6 +286,42 @@ function chooseAnswer(answer) {
     changeCount: nextChangeCount,
     createdAt: new Date().toISOString(),
   });
+
+  state.currentSaveMeta = {
+    questionId: question.id,
+    answer,
+    submitCount: nextSubmitCount,
+    queueId,
+  };
+
+  state.currentSavePromise = apiPost(payload)
+    .then((result) => {
+      if (!result.ok) {
+        throw new Error(result.message || "Failed to save answer.");
+      }
+
+      removeQueueItem(queueId);
+
+      const latestState = state.responsesByQuestionId[question.id];
+      if (
+        latestState &&
+        latestState.finalAnswer === answer &&
+        latestState.submitCount === nextSubmitCount
+      ) {
+        state.responsesByQuestionId[question.id] = {
+          ...latestState,
+          isSaved: true,
+          latestSavedAt: result.savedAt || "",
+          pendingQueueId: null,
+        };
+      }
+
+      return result;
+    })
+    .catch((error) => {
+      console.error("Immediate save error:", error);
+      return null;
+    });
 
   processSaveQueue();
 }
@@ -229,9 +342,60 @@ async function goToNextQuestion() {
   const isLastQuestion = state.currentIndex >= state.questions.length - 1;
 
   if (isLastQuestion) {
-    await flushQueueImmediately();
-    flushQueueOnExit();
-    showDoneScreen();
+    nextBtn.disabled = true;
+    nextBtn.textContent = "Saving...";
+
+    try {
+      if (!currentResponse.isSaved) {
+        const hasMatchingInFlightSave =
+          state.currentSavePromise &&
+          state.currentSaveMeta &&
+          state.currentSaveMeta.questionId === question.id &&
+          state.currentSaveMeta.answer === currentResponse.finalAnswer &&
+          state.currentSaveMeta.submitCount === currentResponse.submitCount;
+
+        if (hasMatchingInFlightSave) {
+          const result = await state.currentSavePromise;
+          if (!result) {
+            throw new Error("Failed to confirm final answer save.");
+          }
+        } else {
+          const result = await apiPost({
+            action: "save_answer",
+            username: state.username,
+            question: question.question,
+            answer: currentResponse.finalAnswer,
+            submitCount: currentResponse.submitCount,
+            changeCount: currentResponse.changeCount,
+          });
+
+          if (!result.ok) {
+            throw new Error(result.message || "Failed to save the final answer.");
+          }
+
+          if (currentResponse.pendingQueueId) {
+            removeQueueItem(currentResponse.pendingQueueId);
+          }
+
+          state.responsesByQuestionId[question.id] = {
+            ...currentResponse,
+            isSaved: true,
+            latestSavedAt: result.savedAt || "",
+            pendingQueueId: null,
+          };
+        }
+      }
+
+      showDoneScreen();
+    } catch (error) {
+      console.error("Final answer save error:", error);
+      statusMessage.textContent =
+        "We could not confirm the last answer was saved. Please try again.";
+    } finally {
+      nextBtn.disabled = false;
+      nextBtn.textContent = "Next question";
+    }
+
     return;
   }
 
@@ -251,11 +415,14 @@ function resetApp() {
   state.currentIndex = 0;
   state.responsesByQuestionId = {};
   state.isQueueProcessing = false;
+  state.currentSavePromise = null;
+  state.currentSaveMeta = null;
 
   usernameInput.value = "";
   loginMessage.textContent = "";
   statusMessage.textContent = "";
   nextBtn.disabled = true;
+  nextBtn.textContent = "Next question";
 
   doneSection.classList.add("hidden");
   quizSection.classList.add("hidden");
@@ -278,6 +445,14 @@ async function processSaveQueue() {
       if (!currentQueue.length) break;
 
       const item = currentQueue[0];
+
+      const isHandledByImmediateSave =
+        state.currentSaveMeta &&
+        state.currentSaveMeta.queueId === item.queueId;
+
+      if (isHandledByImmediateSave) {
+        break;
+      }
 
       try {
         const result = await apiPost({
@@ -305,6 +480,7 @@ async function processSaveQueue() {
             ...responseState,
             isSaved: true,
             latestSavedAt: result.savedAt || "",
+            pendingQueueId: null,
           };
         }
       } catch (error) {
@@ -314,46 +490,6 @@ async function processSaveQueue() {
     }
   } finally {
     state.isQueueProcessing = false;
-  }
-}
-
-async function flushQueueImmediately() {
-  const queue = getQueueFromStorage();
-  if (!queue.length) return;
-
-  const currentQueue = [...queue];
-
-  for (const item of currentQueue) {
-    try {
-      const result = await apiPost({
-        action: "save_answer",
-        username: item.username,
-        question: item.question,
-        answer: item.answer,
-        submitCount: item.submitCount,
-        changeCount: item.changeCount,
-      });
-
-      if (result.ok) {
-        removeQueueItem(item.queueId);
-
-        const responseState = state.responsesByQuestionId[item.questionId];
-        if (
-          responseState &&
-          responseState.finalAnswer === item.answer &&
-          responseState.submitCount === item.submitCount
-        ) {
-          state.responsesByQuestionId[item.questionId] = {
-            ...responseState,
-            isSaved: true,
-            latestSavedAt: result.savedAt || "",
-          };
-        }
-      }
-    } catch (error) {
-      console.error("flushQueueImmediately error:", error);
-      break;
-    }
   }
 }
 
@@ -386,11 +522,7 @@ function flushQueueOnExit() {
       type: "text/plain;charset=utf-8",
     });
 
-    const sent = navigator.sendBeacon(API_BASE_URL, blob);
-
-    if (sent) {
-      removeQueueItem(item.queueId);
-    }
+    navigator.sendBeacon(API_BASE_URL, blob);
   });
 }
 
@@ -415,6 +547,7 @@ function hydrateResponsesFromQueue(username) {
       changeCount: item.changeCount,
       submitCount: item.submitCount,
       isSaved: false,
+      pendingQueueId: item.queueId || null,
     };
   });
 }
@@ -481,4 +614,3 @@ function setLoading(button, isLoading, label) {
 function generateId() {
   return `q_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
-
